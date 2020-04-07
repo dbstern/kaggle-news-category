@@ -1,0 +1,382 @@
+---
+title: "News Category Dataset"
+author: "Deborah Basi Stern"
+# date: "4/4/2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, rows.print=10)
+
+library(tidyverse)
+library(plotly)
+library(knitr)
+library(kableExtra)
+library(jsonlite)
+library(tm)
+library(quanteda)
+library(biganalytics)
+library(mclust)
+library(caret)
+library(e1071)
+library(xgboost)
+library(reticulate)
+
+if(!file.exists("output"))
+  dir.create("output")
+```
+
+## Análise Descritiva
+
+O banco de dados analisado apresenta um pouco mais 200k títulos e descrições breves de reportagens do HuffPost entre 2012 e 2018. Estas reportagens são classificadas segundo categorias que descrevem o assunto da reportagem, como "política" ou "viagem".
+
+```{r}
+# load dataset
+news_file <- file.path("input","News_Category_Dataset_v2.json")
+news <- readLines(con = news_file) %>%
+  paste0(., collapse = ",") %>%
+  paste0("[",.,"]") %>%
+  fromJSON(.) %>%
+  dplyr::mutate(., label_cat = as.integer(as.factor(category))-1)
+```
+
+Na tabela a seguir é apresentada a contagem de cada uma das `r length(unique(news$category))` categorias presentes neste banco de dados:
+
+```{r}
+x <- news %>% dplyr::group_by(.,category) %>%
+  dplyr::summarise(.,n = n()) %>%
+  bind_rows(summarise_all(
+    ., function(x)(if(is.numeric(x)) sum(x) else "Total"))) %>%
+  as.data.frame(.)
+x
+```
+
+## Categorias similares {.tabset}
+
+Algumas categorias parecem que deveriam ser combinadas, elas possuem nomes muito similares, passando a impressão de que foram separadas não intencionalmente. Seguem alguns exemplos:
+
+```{r}
+merged_category <- list(
+  "ARTS" = c("ARTS","ARTS & CULTURE","CULTURE & ARTS"),
+  "EDUCATION" = c("COLLEGE","EDUCATION"), 
+  "FOOD & DRINK" = c("FOOD & DRINK","TASTE"),
+  "PARENTING" = c("PARENTING","PARENTS"),
+  "STYLE" = c("STYLE","STYLE & BEAUTY"),
+  "WORLDPOST" = c("THE WORLDPOST","WORLD NEWS","WORLDPOST")
+) 
+
+x <- lapply(merged_category, function(mc) {
+  news %>% dplyr::filter(., category %in% mc) %>%
+    dplyr::group_by(category) %>%
+    dplyr::slice(1:2) %>%
+    dplyr::ungroup(.) %>%
+    dplyr::select(., category,headline,short_description) %>%
+    kable(.) %>%
+    kable_styling(bootstrap_options = "striped",full_width = T) %>%
+    column_spec(2, width = "25em") %>%
+    column_spec(3, width = "25em")
+})
+```
+
+### ARTS
+```{r, echo=FALSE}
+x[["ARTS"]]
+```
+### EDUCATION
+```{r, echo=FALSE}
+x[["EDUCATION"]]
+```
+### FOOD & DRINK
+```{r, echo=FALSE}
+x[["FOOD & DRINK"]]
+```
+### PARENTING
+```{r, echo=FALSE}
+x[["PARENTING"]]
+```
+### WORLDPOST
+```{r, echo=FALSE}
+x[["WORLDPOST"]]
+```
+## {-}
+
+As junção das categorias sugeridas parecem razoáveis com exceção de "COLLEGE" e "EDUCATION". Elas parecem ter notícias de teor consideravelmente diferentes e refletindo um pouco mais, a primeira soa mais como uma subcategoria da segunda. Logo, elas não serão unidas em nenhuma análise.
+
+```{r}
+merged_category <- list(
+  "ARTS" = c("ARTS","ARTS & CULTURE","CULTURE & ARTS"),
+  "FOOD & DRINK" = c("FOOD & DRINK","TASTE"),
+  "PARENTING" = c("PARENTING","PARENTS"),
+  "STYLE" = c("STYLE","STYLE & BEAUTY"),
+  "WORLDPOST" = c("THE WORLDPOST","WORLD NEWS","WORLDPOST")
+) 
+news <- dplyr::mutate(news, mcategory = category)
+for(i in names(merged_category)) {
+  news <- dplyr::mutate(
+    news, 
+    mcategory = ifelse(mcategory %in% merged_category[[i]], i, mcategory),
+    label_mcat = as.integer(as.factor(mcategory))-1
+  )
+}
+```
+
+Segue a tabela de contagem segundo as novas `r length(unique(news$mcategory))` categorias:
+```{r}
+x <- news %>% dplyr::group_by(.,mcategory) %>%
+  dplyr::summarise(.,n = n()) %>%
+  bind_rows(summarise_all(
+    ., function(x)(if(is.numeric(x)) sum(x) else "Total"))) %>%
+  as.data.frame(.)
+x
+```
+
+## Títulos e descrição
+Parece intuitivo nesta análise juntar o título e a descrição em um único texto e isto será feito nas análises que seguem. No entanto, pode-se observar que `r sum(news$short_description=="")` descrições estão em branco, e, o valor-p muito baixo do teste qui-quadrado indica que existe correlação entre a descrição estar em branco e a categoria (usando as categorias originais ou não). Logo, poderia ser interessante testar um modelo que considere títulos e descrições separadamente em outro momento.
+```{r}
+chisq.test((news$short_description==""), news$category)
+chisq.test((news$short_description==""), news$mcategory)
+```
+
+## Pré-processamento do texto {.tabset}
+Como mencionado, a análise será feita com o texto formado pela união do título e descrição. Além disso, serão retirados quaisquer símbolos que não sejam letras ou espaços simples e todas as letras maiúsculas serão trocadas por minúsculas.
+```{r}
+news$txt <- paste(news$headline, news$short_description) %>%
+  tolower() %>%
+  # remove everything that is not a number or letter
+  stringr::str_replace_all(.,"[^a-zA-Z\\s]", " ") %>%
+  removeNumbers() %>%
+  stripWhitespace() %>%
+  enc2utf8(.) # encode as utf-8
+```
+
+Através do bag-of-words é feita a contagem de palavras por texto.
+```{r}
+bow <- quanteda::dfm(news$txt, verbose = TRUE)
+countspace <- numeric(nrow(news))
+for(i in 1:nrow(news))
+  countspace[i] <- length(gregexpr(" ", news$txt[i])[[1]])
+bow <- cbind(countspace, bow)
+colnames(bow)[1] <- "</s>"
+```
+
+O corpus apresenta ao todo `r dim(bow)[2]-1` palavras distintas. Numa análise inicial, pretende-se utilizar o bag-of-words como input dos modelos. Para isto, serão retiradas as palavras com contagem menor que 1k. Estas palavras que aparecem muito pouco no corpus costumam não ter peso nos modelos e inflam desnecessariamente a dimensão dos dados. No corpus análisado, estas palavras representariam `r sum(colSums(bow) <= 999)` colunas da matriz do bag-of-words.
+
+Após a retirada das palavras raras, serão retirados os textos com contagem de palavras nula.  
+```{r}
+# bow <- bow[, colSums(bow) > 999]
+# rbow <- rowSums(bow)
+# 
+# idx_rm <- which(rbow == 1)
+# bow <- bow[-idx_rm,]
+file <- file.path("output","bow.rds")
+# saveRDS(bow, file = file)
+bow <- readRDS(file)
+
+idx_keep <- row.names(bow) %>%
+  str_replace(.,"text","") %>% as.numeric(.)
+news <- news[idx_keep,]
+```
+
+Abaixo seguem os gráficos de densidade segunda a contagem de palavras por categoria após o pré-processamento.
+
+### Categorias Originais
+```{r, echo=F}
+x <- news %>% dplyr::mutate(., nwords = rowSums(bow[,-1]))
+gg <- ggplot(x, aes(nwords)) +
+  stat_density(aes(group = category, color = category),
+               position="identity", geom="line")
+plotly::ggplotly(gg)
+```
+
+### Categorias Unidas
+```{r, echo=F}
+gg <- ggplot(x, aes(nwords)) +
+  stat_density(aes(group = mcategory, color = mcategory),
+               position="identity", geom="line")
+plotly::ggplotly(gg)
+```
+
+## {-}
+
+## Aprendizagem Não Supervisionada
+
+Considerando que as categorias não estam disponíveis para análise, poderia ser aplicado algum método de Clustering, como k-means. Este tipo de análise poderia ser feito para fazer um sistema de recomendação: dado o interesse em um texto, seriam recomendados textos pertencentes do mesmo cluster. No entanto, não seria possível atribuir uma categoria específica aos textos neste método.
+
+## K-Means {.tabset}
+
+```{r}
+# sbow <- scale(as.matrix(bow))
+
+file <- file.path("output","bow_kmeans.rds")
+# x <- list()
+# 
+# x$res_cat <- biganalytics::bigkmeans(x = sbow, iter.max=100, centers = 41, nstart = 10)
+# x$ari_cat <- mclust::adjustedRandIndex(x$res_cat$cluster,news$category)
+# x$accaret_cat <- confusionMatrix(
+#   factor(x$res_cat$cluster-1), reference=factor(news$label_cat), mode = "everything")
+# 
+# x$res_mcat <- biganalytics::bigkmeans(x = sbow, iter.max=100, centers = 34, nstart = 10)
+# x$ari_mcat <- mclust::adjustedRandIndex(x$res_mcat$cluster,news$mcategory)
+# x$accaret_mcat <- confusionMatrix(
+#   factor(x$res_mcat$cluster-1), reference=factor(news$label_mcat), mode = "everything")
+# 
+# saveRDS(x, file)
+x <- readRDS(file)
+```
+
+Este modelo de clustering obtem uma divisão bem diferente das determinadas pelas categorias. O Índice Rand Ajustado (IRA) é muito baixo, sejam usadas as categorias originais (IRA=`r x$ari_cat`) ou as categorias unidas que criamos (IRA=`r x$ari_mcat`). Abaixo seguem as matrizes de confusão destes modelos: cada linha é um cluster formado pelo método e as colunas são as categorias verdadeiras segundo o banco de dados.
+
+### Categorias Originais
+```{r, echo=FALSE}
+tx <- x$accaret_cat$table
+txl <- dplyr::select(news,category,label_cat) %>%
+  unique(.) %>% arrange(.,label_cat)
+dimnames(tx)[["Reference"]] <- txl$category
+kable(tx) %>%
+  kable_styling(full_width = T) %>%
+  scroll_box(width = "900px", height = "400px")
+```
+### Categorias Unidas
+```{r, echo=FALSE}
+tx <- x$accaret_mcat$table
+txl <- dplyr::select(news,mcategory,label_mcat) %>%
+  unique(.) %>% arrange(.,label_mcat)
+dimnames(tx)[["Reference"]] <- txl$mcategory
+kable(tx) %>%
+  kable_styling(full_width = T) %>%
+  scroll_box(width = "900px", height = "400px")
+```
+
+## {-}
+
+Métodos Hierárquicos de Análise de Cluster têm a desvantagem de não permitirem que um ajuste feito a uma amostra seja usado para alocar uma nova observação a dos clusters criados previamente - é necessario ajustar novamente o modelo à nova base de dados. No entanto, poderiam ser estudados em outro momento para testar a performance de seus resultados.
+
+## Aprendizagem Supervisionada
+Outra abordagem seria obter a categoria de pelo menos uma parte dos textos para o treinamento de algum modelo de aprendizagem supervisionada. Apesar do custo para a obtenção das categorias, o modelo gerado seria capaz de realizar a predição das categorias em outras observações.
+
+## Divisão entre treino e teste {.tabset}
+Para testar modelos de Aprendizagem Supervisionada, vamos separar aleatóriamente 10% das observações para treino. Nas tabelas abaixo é possível verificar que a amostra de treino gerada desta forma ainda apresenta observações de todas as categorias:
+
+```{r}
+set.seed(1)
+train <- sample(c(T,F), nrow(news), c(.1,.9), replace = TRUE)
+
+```
+
+### Categorias Originais
+```{r, echo=FALSE}
+x <- news[train,] %>% dplyr::group_by(.,category) %>%
+  dplyr::summarise(.,n = n()) %>%
+  bind_rows(summarise_all(
+    ., function(x)(if(is.numeric(x)) sum(x) else "Total"))) %>%
+  as.data.frame(.)
+kable(x) %>%
+  kable_styling(full_width = F) %>%
+  scroll_box(height = "200px")
+```
+### Categorias Unidas
+```{r, echo=FALSE}
+x <- news[train,] %>% dplyr::group_by(.,mcategory) %>%
+  dplyr::summarise(.,n = n()) %>%
+  bind_rows(summarise_all(
+    ., function(x)(if(is.numeric(x)) sum(x) else "Total"))) %>%
+  as.data.frame(.)
+kable(x) %>%
+  kable_styling(full_width = F) %>%
+  scroll_box(height = "200px")
+```
+
+## {-}
+
+## Extreme Gradient Boosting (xgb)
+
+A união das categorias similares melhora um pouco a acurácia do xgb:
+```{r}
+# fit_xgboost <- function(data, train, file_out) {
+#   fit <- list()
+#   params <- list(
+#     lambda = 0.01,
+#     objective = "multi:softmax",
+#     metrics = "merror",
+#     num_class = length(unique(getinfo(data,"label"))),
+#     early_stopping_rounds = 10
+#   )
+#   
+#   dtrain <- xgboost::slice(data, idxset = which(train))
+#   fit$xgbcv <- xgboost::xgb.cv(params = params, data = dtrain,
+#                                nround = 10000, nfold = 2, verbose = FALSE)
+#   
+#   nround <- which.min(fit$xgbcv$evaluation_log$test_merror_mean)
+#   fit$xgb <- xgboost::xgb.train(params = params, data = dtrain,
+#                                 nround = nround, verbose = FALSE)
+#   rm(dtrain); gc()
+#   
+#   dtest <- xgboost::slice(data, idxset = which(!train))
+#   fit$test <- as.numeric(predict(fit$xgb, dtest, type = "response"))
+#   fit$acc <- sum(fit$test==xgboost::getinfo(dtest, 'label'))/sum(!train)
+#   fit$accaret <- confusionMatrix(
+#     factor(fit$test),
+#     factor(xgboost::getinfo(dtest, 'label')),
+#     mode = "everything"
+#     )
+#   saveRDS(fit, file = file_out)
+#   rm(dtest); gc()
+#   
+#   return(fit)
+# }
+# 
+# x <- xgb.DMatrix(bow)
+# xgboost::setinfo(object = x, 'label', news$label_cat)
+fit_file <- file.path("output","bowxgb_cat.rds")
+# fit_cat <- fit_xgboost(data = x, train = train10, file_out = fit_file)
+fit_cat <- readRDS(fit_file)
+fit_cat$accaret$overall <- fit_cat$accaret$overall %>%
+  t() %>% as.data.frame(.) %>%
+  dplyr::mutate(., merged_category = F)
+# 
+# x <- xgb.DMatrix(bow)
+# xgboost::setinfo(object = x, 'label', x$label_mcat)
+fit_file <- file.path("output","bowxgb_mcat.rds")
+# fit_mcat <- fit_xgboost(data = x, train = train10, file_out = fit_file)
+fit_mcat <- readRDS(fit_file)
+fit_mcat$accaret$overall <- fit_mcat$accaret$overall %>%
+  t() %>% as.data.frame(.) %>%
+  dplyr::mutate(., merged_category = T)
+
+x <- rbind(fit_cat$accaret$overall,fit_mcat$accaret$overall)
+kable(x, digits = 3) %>%
+  kable_styling(full_width = T)
+```
+
+Abaixo é possível observar a tabela de confusão.
+```{r}
+x <- fit_mcat$accaret$table
+xl <- dplyr::select(news,mcategory,label_mcat) %>%
+  unique(.) %>% arrange(.,label_mcat)
+dimnames(x)[[1]] <- xl$mcategory
+dimnames(x)[[2]] <- xl$mcategory
+kable(x) %>%
+  kable_styling(full_width = T) %>%
+  scroll_box(width = "900px", height = "400px")
+```
+É interessante reparar que algumas categorias parecem ser especialmente "confundidas", como "POLITICS" e "WORLDPOST". Estas categorias apesar de diferentes apresentam notícias com conteúdo próximo: eventos externos podem influenciar decisões políticas internas assim como o contrário, e portanto textos de uma categoria podem apresentar uma distribuição de palavras similar ao dos textos da outra categoria. Logo, teriam contagens de palavras similares, se diferenciando mais pela ordem em que as palavras aparecem no texto.
+
+```{r}
+news %>%
+  dplyr::filter(., mcategory %in% c("POLITICS","WORLDPOST")) %>%
+    dplyr::group_by(mcategory) %>%
+    dplyr::slice(1:4) %>%
+    dplyr::ungroup(.) %>%
+    dplyr::select(., mcategory,headline,short_description) %>%
+    kable(.) %>%
+    kable_styling(bootstrap_options = "striped",full_width = T) %>%
+    column_spec(2, width = "25em") %>%
+    column_spec(3, width = "25em")
+```
+
+Por conta disto, usar um modelo de representação vetorial de textos como o doc2vec poderia ser melhor. O doc2vec considera a ordenação em que as palavras estão presentes no texto para criar as representaçôes vetoriais, enquanto o bag-of-words não. Isto poderia auxiliar na distinção destes tópicos mais próximos. 
+
